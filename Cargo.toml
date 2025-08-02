@@ -1,0 +1,22 @@
+[package]
+name = "server_share"
+description = "Share your local server with peer-to-peer network"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+iroh = "0.91"
+rand = "0.8"
+bs58 = "0.5"
+toml = "0.9"
+serde = "1"
+
+[profile.release]
+strip = "debuginfo"
+debug = false
+lto = "fat"
+opt-level = "z"
+# codegen-units = 1
+panic = "abort"

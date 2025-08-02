@@ -1,0 +1,466 @@
+use std::{
+    fmt::Display,
+    io::ErrorKind,
+    net::{SocketAddr, ToSocketAddrs},
+    path::Path,
+    pin::pin,
+    task::{Context, Waker},
+};
+
+use clap::{Parser, Subcommand};
+use iroh::{
+    Endpoint, NodeAddr, NodeId, SecretKey, Watcher,
+    discovery::pkarr::{PkarrPublisher, PkarrResolver},
+};
+use serde::{Deserialize, Serialize};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional},
+    net::{TcpListener, TcpSocket},
+    spawn,
+    task::JoinHandle,
+};
+
+const PACKAGE_NAME: &str = env!("CARGO_PKG_NAME");
+const CONFIG_FILE: &str = "config.toml";
+const DEFAULT_ALPN: &str = "ServerP2Pv0";
+const TICKET_PREFIX: &str = "sp2p";
+const HANDSHAKE_REQUEST: &[u8] = b"sp2pPing";
+const HANDSHAKE_RESPONSE: &[u8] = b"sp2pPong";
+
+/// Share your local server without public IP address
+#[derive(Parser, Debug)]
+pub struct Args {
+    #[clap(subcommand)]
+    pub command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Commands {
+    /// Listen on connections to local port and forward them to remote shared server.
+    Listen(ListenArgs),
+
+    /// Creates a server and prints a node address that can be used to connect.
+    Serve(ServeArgs),
+
+    /// Generates a server config.toml file in current directory.
+    ///
+    /// Will generate a config.toml with private key that can be used to keep server ticket stable.
+    Prepare(PrepareArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct CommonArgs {
+    /// A custom ALPN to use for the quic endpoint
+    ///
+    /// This is an expert feature and should only be used if you know what you're doing.
+    #[clap(long, default_value = DEFAULT_ALPN)]
+    pub custom_alpn: String,
+
+    /// The verbosity level. Repeat to increase verbosity.
+    #[clap(short = 'v', long, action = clap::ArgAction::Count)]
+    pub verbose: u8,
+}
+
+#[derive(Parser, Debug)]
+pub struct ListenArgs {
+    #[clap(flatten)]
+    pub common: CommonArgs,
+
+    /// The host from which to listen, with optional port. Defaults to localhost:8080 (127.0.0.1:8080).
+    ///
+    /// The host must be a resolvable hostname to which a socket can be bound. e.g 127.0.0.1 or 0.0.0.0
+    #[clap(short = 'f', long)]
+    pub from: Option<String>,
+
+    /// The server's ticket to connect to. Ticket is printed when you call `serve` command
+    pub ticket: String,
+}
+
+#[derive(Parser, Debug)]
+pub struct ServeArgs {
+    #[clap(flatten)]
+    pub common: CommonArgs,
+
+    /// The host to which to pass the traffic, e.g localhost:25565
+    pub to: String,
+}
+
+#[derive(Parser, Debug)]
+pub struct PrepareArgs {
+    /// The verbosity level. Repeat to increase verbosity.
+    #[clap(short = 'v', long, action = clap::ArgAction::Count)]
+    pub verbose: u8,
+}
+
+#[tokio::main]
+async fn main() {
+    let args = Args::parse();
+    match args.command {
+        Commands::Listen(args) => {
+            let Ok(listen_address) =
+                lookup_dns(&args.from.unwrap_or("127.0.0.1:8080".to_string()), 8080)
+                    .map_err(|err| fatal(err));
+            let secret = ConfigFile::read().get_or_generate_secret_key();
+            listen(
+                secret,
+                args.common.custom_alpn.as_bytes(),
+                args.common.verbose,
+                &args.ticket,
+                listen_address,
+            )
+            .await;
+        }
+        Commands::Serve(args) => {
+            let Ok(server_address) = lookup_dns(&args.to, 8080).map_err(|err| fatal(err));
+            let secret = ConfigFile::read().get_or_generate_secret_key();
+            serve(
+                secret,
+                args.common.custom_alpn.as_bytes(),
+                args.common.verbose,
+                server_address,
+            )
+            .await;
+        }
+        Commands::Prepare(args) => {
+            let secret = SecretKey::generate(&mut rand::thread_rng());
+            let secret_txt = bs58::encode(secret.to_bytes()).into_string();
+            if args.verbose > 0 {
+                println!("Secret key: {secret_txt}");
+            }
+
+            let config = ConfigFile {
+                config: Some(ConfigEntry {
+                    secret_key: secret_txt,
+                    allow_list: None,
+                }),
+            };
+            let toml_file = toml::to_string_pretty(&config).expect("Cannot serialize config file");
+            _ = tokio::fs::write(CONFIG_FILE, toml_file)
+                .await
+                .map_err(|err| fatal(format_args!("Cannot write {CONFIG_FILE} file: {err}")));
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConfigFile {
+    config: Option<ConfigEntry>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConfigEntry {
+    secret_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allow_list: Option<Vec<String>>,
+}
+
+impl ConfigFile {
+    pub fn read() -> ConfigFile {
+        let path = Path::new(CONFIG_FILE);
+        if path.exists() {
+            let Ok(config) = std::fs::read_to_string(path)
+                .map_err(|err| fatal(format_args!("Cannot read {CONFIG_FILE} file: {err}")));
+            let config: ConfigFile = match toml::from_str(&config) {
+                Ok(config) => config,
+                Err(err) => fatal(format_args!("Cannot parse config file: {err}")),
+            };
+            return config;
+        }
+        ConfigFile { config: None }
+    }
+
+    pub fn get_secret_key(&self) -> Option<SecretKey> {
+        let key = &self.config.as_ref()?.secret_key;
+        let bytes = match bs58::decode(key).into_vec() {
+            Ok(bytes) => bytes,
+            Err(_) => fatal(format_args!(
+                "Cannot decode secret_key, it should be a base58 string"
+            )),
+        };
+        let bytes = match bytes.as_slice().try_into() {
+            Ok(bytes) => bytes,
+            Err(_) => fatal(format_args!("Invalid secret key length")),
+        };
+        Some(SecretKey::from_bytes(bytes))
+    }
+    pub fn get_or_generate_secret_key(&self) -> SecretKey {
+        if let Some(key) = self.get_secret_key() {
+            return key;
+        }
+        SecretKey::generate(&mut rand::thread_rng())
+    }
+}
+
+fn lookup_dns(hostname: &str, default_port: u16) -> Result<SocketAddr, String> {
+    let (host, port) = hostname.rsplit_once(':').unwrap_or((hostname, ""));
+
+    let ip_addr = (host, 1234u16)
+        .to_socket_addrs()
+        .map_err(|err| format!("Cannot read ip address from '{hostname}', err: {err}"))?;
+
+    let mut port_num = default_port;
+    if !port.is_empty() {
+        port_num = port
+            .parse()
+            .map_err(|err| format!("Cannot parse port number from '{hostname}', err: {err}"))?;
+    }
+    let ip_addr = ip_addr
+        .map(|addr| addr.ip())
+        .find(|ip| ip.is_ipv4())
+        .ok_or_else(|| format!("No ip address found for '{hostname}'"))?;
+    Ok(SocketAddr::new(ip_addr, port_num))
+}
+
+fn fatal(value: impl Display) -> ! {
+    eprintln!("Fatal error:\n  {value}\nexiting...");
+    std::process::exit(1);
+}
+
+async fn serve(secret: SecretKey, alpn: &[u8], verbose: u8, server_address: SocketAddr) {
+    let discovery = PkarrPublisher::n0_dns().build(secret.clone());
+
+    let builder = Endpoint::builder()
+        .secret_key(secret.clone())
+        .discovery(discovery)
+        .alpns(vec![alpn.to_vec()]);
+
+    let Ok(endpoint) = builder
+        .bind()
+        .await
+        .map_err(|e| fatal(format_args!("Cannot start endpoint: {e}")));
+    let init = endpoint.home_relay().initialized().await;
+    if verbose > 0 {
+        println!("Initialized home relay url: {init}");
+    }
+    let node_addr = endpoint.node_addr().initialized().await;
+
+    let shutdown_task = closing_task(endpoint.clone());
+
+    spawn(async move {
+        while let Some(accepted) = endpoint.accept().await {
+            spawn(async move {
+                let accepted = match accepted.await {
+                    Ok(accepted) => accepted,
+                    Err(e) => {
+                        println!("Error accepting connection: {e}, skipping...");
+                        return;
+                    }
+                };
+                let id = accepted.remote_node_id().map(encode_ticket);
+                let id = id.unwrap_or_else(|_| "<unknown>".into());
+                if verbose > 0 {
+                    println!("Accepted connection from {id}");
+                }
+                let mut stream_count = 0;
+                loop {
+                    let (send, recv) = match accepted.accept_bi().await {
+                        Ok(stream) => stream,
+                        Err(e) => {
+                            let result = pin!(accepted.closed())
+                                .poll(&mut Context::from_waker(Waker::noop()));
+                            if result.is_ready() {
+                                if verbose > 0 {
+                                    println!("Connection closed by peer, from {id}");
+                                }
+                                return;
+                            } else {
+                                println!("Error accepting stream: {e}, dropping connection...");
+                                continue;
+                            }
+                        }
+                    };
+                    stream_count += 1;
+                    if verbose > 1 {
+                        println!("Accepted stream {stream_count} from {id}");
+                    }
+                    let mut src_stream = tokio::io::join(recv, send);
+                    let id = id.clone();
+                    spawn(async move {
+                        //handshake
+                        if let Err(e) = handshake(&mut src_stream, true).await {
+                            println!("Error during handshake: {e}, dropping connection...");
+                            return;
+                        }
+                        if verbose > 1 {
+                            println!("Handshake successful, stream {stream_count} from {id}");
+                        }
+
+                        let socket_result = match server_address {
+                            SocketAddr::V4(_) => TcpSocket::new_v4(),
+                            SocketAddr::V6(_) => TcpSocket::new_v6(),
+                        };
+                        let socket = match socket_result {
+                            Ok(socket) => socket,
+                            Err(e) => {
+                                println!("Error creating socket: {e}, dropping connection...");
+                                return;
+                            }
+                        };
+                        let mut dst_stream = match socket.connect(server_address).await {
+                            Ok(stream) => stream,
+                            Err(e) => {
+                                println!(
+                                    "Error connecting to {server_address} : {e}, dropping connection..."
+                                );
+                                return;
+                            }
+                        };
+                        if let Err(e) = copy_bidirectional(&mut src_stream, &mut dst_stream).await {
+                            println!("Error copying stream: {e}, dropping connection...");
+                        }
+                        if verbose > 1 {
+                            println!("Stream {stream_count} closed from {id}");
+                        }
+                    });
+                }
+            });
+        }
+    });
+
+    tokio::task::yield_now().await;
+
+    let ticket = encode_ticket(node_addr.node_id);
+
+    println!("Passing connections to {server_address}");
+    println!("Use this ticket to connect: {ticket}");
+    let name = std::env::args().next().unwrap_or(PACKAGE_NAME.to_string());
+    println!(
+        "    example usage: {name} listen --from localhost:{} {ticket}",
+        server_address.port()
+    );
+    println!("Press ctrl-c to exit");
+
+    shutdown_task.await.expect("task panic");
+    std::process::exit(0);
+}
+
+fn closing_task(endpoint: Endpoint) -> JoinHandle<()> {
+    spawn(async move {
+        _ = tokio::signal::ctrl_c().await;
+        println!(
+            "\nPressed ctrl-c, shutting down... (this may take a few seconds, press ctrl-c again to force)"
+        );
+        // tokio::select! would make this block forever
+        spawn(async move {
+            _ = tokio::signal::ctrl_c().await;
+            println!("\nPressed ctrl-c again, forced shutdown...");
+            std::process::exit(0);
+        });
+        spawn(async move {
+            endpoint.close().await;
+            println!("Shutdown complete.");
+            std::process::exit(0);
+        });
+    })
+}
+
+async fn listen(
+    _secret: SecretKey,
+    alpn: &[u8],
+    verbose: u8,
+    ticket: &str,
+    listen_address: SocketAddr,
+) {
+    let Ok(node_addr) = decode_ticket(ticket)
+        .map(NodeAddr::new)
+        .ok_or_else(|| fatal(format_args!("Invalid ticket: {ticket}")));
+
+    let discovery = PkarrResolver::n0_dns().build();
+
+    let builder = Endpoint::builder().discovery(discovery);
+
+    let Ok(endpoint) = builder
+        .bind()
+        .await
+        .map_err(|e| fatal(format_args!("Cannot start endpoint: {e}")));
+
+    let closing_task = closing_task(endpoint.clone());
+
+    println!("Connecting to {ticket}");
+    println!("Press ctrl-c to exit");
+
+    let Ok(conn) = endpoint
+        .connect(node_addr, alpn)
+        .await
+        .map_err(|e| fatal(format_args!("Cannot connect to {ticket}: {e}")));
+    if verbose > 0 {
+        println!("Connected to {ticket}");
+    }
+    let Ok(listener) = TcpListener::bind(listen_address)
+        .await
+        .map_err(|e| fatal(format_args!("Cannot listen on {listen_address}: {e}")));
+    if verbose > 0 {
+        println!("Listening on {listen_address}");
+    }
+    while let Ok((mut src_stream, addr)) = listener.accept().await {
+        if verbose > 0 {
+            println!("Accepted socket connection from {addr}");
+        }
+        let Ok((send, recv)) = conn
+            .open_bi()
+            .await
+            .map_err(|e| fatal(format_args!("Cannot accept stream on: {e}")));
+
+        let mut dst_stream = tokio::io::join(recv, send);
+        //handshake
+        if let Err(e) = handshake(&mut dst_stream, false).await {
+            println!("Error during handshake: {e}, dropping connection...");
+            return;
+        }
+        if verbose > 1 {
+            println!("Handshake successful");
+        }
+
+        spawn(async move {
+            if let Err(e) = copy_bidirectional(&mut dst_stream, &mut src_stream).await {
+                println!("Error copying stream: {e}, dropping connection...");
+            }
+            if verbose > 0 {
+                println!("Connection {addr} closed");
+            }
+        });
+    }
+    closing_task.abort();
+    println!("Listener closed");
+    std::process::exit(0);
+}
+
+fn encode_ticket(node_id: NodeId) -> String {
+    let id = bs58::encode(node_id.as_bytes()).into_string();
+    format!("{TICKET_PREFIX}{id}")
+}
+
+fn decode_ticket(ticket: &str) -> Option<NodeId> {
+    let id = ticket.strip_prefix(TICKET_PREFIX)?.as_bytes();
+    let bytes = bs58::decode(id).into_vec().ok()?;
+    NodeId::from_bytes(bytes.as_slice().try_into().ok()?).ok()
+}
+
+async fn handshake<RW: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut RW,
+    request: bool,
+) -> std::io::Result<()> {
+    if request {
+        let mut buff = [0; HANDSHAKE_REQUEST.len()];
+        stream.read_exact(&mut buff).await?;
+        if buff != HANDSHAKE_REQUEST {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "Invalid handshake request",
+            ));
+        }
+        stream.write_all(&HANDSHAKE_RESPONSE).await?;
+        stream.flush().await?;
+    } else {
+        stream.write_all(&HANDSHAKE_REQUEST).await?;
+        stream.flush().await?;
+        let mut buff = [0; HANDSHAKE_RESPONSE.len()];
+        stream.read_exact(&mut buff).await?;
+        if buff != HANDSHAKE_RESPONSE {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "Invalid handshake response",
+            ));
+        }
+    }
+    Ok(())
+}
