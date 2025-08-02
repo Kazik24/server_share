@@ -16,7 +16,7 @@ Utility to share your local server without public IP address. Built with [iroh](
 
 **Starting server:**
 
-To enable other users to connect yo your locally running server, open terminal on machine with your server and run:
+To enable other users to connect yo your locally running server (e.g minecraft server on localhost:25565), open terminal on machine with your server and run:
 
 ```bash
 server_share serve localhost:25565
@@ -44,9 +44,12 @@ To make your ticket persistent, generate a config.toml file with your secret key
 ```bash
 server_share prepare
 ```
-This will generate a config.toml file in current directory that will look like this:
+This will generate a config.toml file in current directory that will look something like this:
 ```toml
 [config]
-secret_key = "11111111111111111111111111111111" # of course you will have a different key here every time you run this command
+# of course you will have a different key here every time you run this command
+secret_key = "11111111111111111111111111111111"
 ```
 After that you can run `server_share serve ...` and it will present you the same ticket every time.
+
+**Warning: Do not share this key with other users, it can be used to impersonate your address.**
