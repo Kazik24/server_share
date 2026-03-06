@@ -16,7 +16,7 @@ Utility to share your local server without public IP address. Built with [iroh](
 
 **Starting server:**
 
-To enable other users to connect yo your locally running server (e.g minecraft server on localhost:25565), open terminal on machine with your server and run:
+To enable other users to connect to your locally running server (e.g minecraft server on localhost:25565), open terminal on machine with your server and run:
 
 ```bash
 server_share serve localhost:25565

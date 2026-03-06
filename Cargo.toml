@@ -7,11 +7,12 @@ edition = "2024"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
-iroh = "0.91"
-rand = "0.8"
+iroh = "0.96"
+rand = "0.9"
 bs58 = "0.5"
-toml = "0.9"
+toml = "1"
 serde = "1"
+futures = "0.3"
 
 [profile.release]
 strip = "debuginfo"
