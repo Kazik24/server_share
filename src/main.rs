@@ -16,7 +16,11 @@ use clap::{Parser, Subcommand};
 use futures::{StreamExt, stream::BoxStream};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr, Watcher,
-    address_lookup::{self, AddressLookup, PkarrPublisher, PkarrPublisherBuilder, PkarrResolver},
+    address_lookup::{
+        self, AddressLookup, PkarrPublisher, PkarrPublisherBuilder, PkarrResolver,
+        PkarrResolverBuilder,
+    },
+    endpoint::presets,
     endpoint_info::EndpointData,
 };
 use serde::{Deserialize, Serialize};
@@ -295,15 +299,14 @@ async fn serve(
     allow_list: Option<Vec<EndpointId>>,
 ) {
     let allow_list = allow_list.map(Arc::new);
-    let address_lookup = RefreshablePkarrPublisher::new(
+    let address_lookup = RefreshablePkarrPublisher::builder(
         PkarrPublisher::n0_dns,
-        PkarrResolver::n0_dns().build(),
-        secret.clone(),
+        PkarrResolver::n0_dns(),
         Duration::from_secs(30),
         verbose,
     );
 
-    let builder = Endpoint::builder()
+    let builder = Endpoint::builder(presets::N0)
         .secret_key(secret.clone())
         .address_lookup(address_lookup)
         .alpns(vec![alpn.to_vec()]);
@@ -541,9 +544,9 @@ async fn listen(
         .map(EndpointAddr::new)
         .ok_or_else(|| fatal(format_args!("Invalid ticket: {ticket}")));
 
-    let address_lookup = PkarrResolver::n0_dns().build();
+    let address_lookup = PkarrResolver::n0_dns();
 
-    let mut builder = Endpoint::builder().address_lookup(address_lookup);
+    let mut builder = Endpoint::builder(presets::N0).address_lookup(address_lookup);
     if let Some(secret) = secret.clone() {
         builder = builder.secret_key(secret);
     }
@@ -701,19 +704,38 @@ pub struct RefreshablePkarrPublisher {
     inner: Arc<Mutex<PkarrPublisher>>,
     handle: AbortHandle,
 }
-impl std::fmt::Debug for RefreshablePkarrPublisher {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RefreshablePkarrPublisher").finish()
-    }
+pub struct RefreshablePkarrPublisherBuilder<F> {
+    builder: F,
+    check_resolver: PkarrResolverBuilder,
+    check_period: Duration,
+    verbose: u8,
 }
 
 impl RefreshablePkarrPublisher {
-    pub fn new(
-        builder: impl Fn() -> PkarrPublisherBuilder + Send + Sync + 'static,
-        check_resolver: PkarrResolver,
-        secret: SecretKey,
+    pub fn builder<F>(
+        builder: F,
+        check_resolver: PkarrResolverBuilder,
         check_period: Duration,
         verbose: u8,
+    ) -> RefreshablePkarrPublisherBuilder<F>
+    where
+        F: Fn() -> PkarrPublisherBuilder + Send + Sync + 'static,
+    {
+        RefreshablePkarrPublisherBuilder {
+            builder,
+            check_resolver,
+            check_period,
+            verbose,
+        }
+    }
+
+    pub fn new(
+        builder: impl Fn() -> PkarrPublisherBuilder + Send + Sync + 'static,
+        check_resolver: PkarrResolverBuilder,
+        check_period: Duration,
+        verbose: u8,
+        secret: SecretKey,
+        tls_config: rustls::ClientConfig,
     ) -> Self {
         let make_builder = Arc::new(builder);
         let builder = make_builder.clone();
@@ -733,7 +755,9 @@ impl RefreshablePkarrPublisher {
             .await
             .unwrap_or(false)
         }
-        let inner = Arc::new(Mutex::new(make_builder().build(secret.clone())));
+        let tls_config_clone = tls_config.clone();
+        let check_resolver = check_resolver.build(tls_config_clone.clone());
+        let inner = Arc::new(Mutex::new(make_builder().build(secret.clone(), tls_config)));
         let last_data = Arc::new(Mutex::new(None));
         let inner_clone = inner.clone();
         let last_data_clone = last_data.clone();
@@ -745,7 +769,7 @@ impl RefreshablePkarrPublisher {
                     if verbose > 0 {
                         println!("Resolver couldn't find my ticket, refreshing...");
                     }
-                    let new_publisher = builder().build(secret.clone());
+                    let new_publisher = builder().build(secret.clone(), tls_config_clone.clone());
                     if let Some(data) = last_data_clone.lock().unwrap().as_ref() {
                         new_publisher.publish(data);
                     }
@@ -767,6 +791,25 @@ impl Drop for RefreshablePkarrPublisher {
     }
 }
 
+impl<F> address_lookup::AddressLookupBuilder for RefreshablePkarrPublisherBuilder<F>
+where
+    F: Fn() -> PkarrPublisherBuilder + Send + Sync + 'static,
+{
+    fn into_address_lookup(
+        self,
+        endpoint: &Endpoint,
+    ) -> Result<impl AddressLookup, address_lookup::AddressLookupBuilderError> {
+        Ok(RefreshablePkarrPublisher::new(
+            self.builder,
+            self.check_resolver,
+            self.check_period,
+            self.verbose,
+            endpoint.secret_key().clone(),
+            endpoint.tls_config().clone(),
+        ))
+    }
+}
+
 impl address_lookup::AddressLookup for RefreshablePkarrPublisher {
     fn publish(&self, data: &EndpointData) {
         *self.last_data.lock().unwrap() = Some(data.clone());
@@ -777,6 +820,17 @@ impl address_lookup::AddressLookup for RefreshablePkarrPublisher {
         node_id: EndpointId,
     ) -> Option<BoxStream<'static, Result<address_lookup::Item, address_lookup::Error>>> {
         self.inner.lock().unwrap().resolve(node_id)
+    }
+}
+
+impl<F> std::fmt::Debug for RefreshablePkarrPublisherBuilder<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefreshablePkarrPublisherBuilder").finish()
+    }
+}
+impl std::fmt::Debug for RefreshablePkarrPublisher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefreshablePkarrPublisher").finish()
     }
 }
 
